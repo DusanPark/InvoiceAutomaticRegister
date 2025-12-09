@@ -670,6 +670,7 @@ def add_table_config_view(request, declaration_id):
     work_group = request.POST.get('work_group', '').strip()
     db_table_name = request.POST.get('db_table_name', '').strip()
     process_order = request.POST.get('process_order', '').strip()
+    table_prompt = request.POST.get('table_prompt', '').strip()
     service_user_id = request.POST.get('service_user_id')
     
     # 유효성 검사
@@ -703,6 +704,7 @@ def add_table_config_view(request, declaration_id):
         work_group=work_group,
         db_table_name=db_table_name,
         process_order=process_order,
+        table_prompt=table_prompt if table_prompt else None,
         is_active=True
     )
     
@@ -726,7 +728,8 @@ def update_table_config_view(request, config_id):
     work_group = request.POST.get('work_group', '').strip()
     db_table_name = request.POST.get('db_table_name', '').strip()
     process_order = request.POST.get('process_order', '').strip()
-    
+    table_prompt = request.POST.get('table_prompt', '').strip()
+
     # 유효성 검사
     if not all([work_group, db_table_name, process_order]):
         return JsonResponse({'success': False, 'error': '모든 필수 필드를 입력해주세요.'})
@@ -750,6 +753,7 @@ def update_table_config_view(request, config_id):
     config.work_group = work_group
     config.db_table_name = db_table_name
     config.process_order = process_order
+    config.table_prompt = table_prompt if table_prompt else None
     config.save()
     
     return JsonResponse({

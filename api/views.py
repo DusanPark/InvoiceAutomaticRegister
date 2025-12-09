@@ -33,6 +33,7 @@ def process_invoice(request):
     - customs_code: 관세사 코드 (예: 6N003) 또는 'default'
     - declaration_code: 신고서 코드 (예: CUSDEC929)
     - ai_engine: AI 엔진 선택 (gemini 또는 gpt, 기본값: gemini)
+    - hs_code_process_order: HS 코드 추천을 실행할 테이블 처리 순서 (선택, 예: 1)
 
     Response:
     - success: 성공 여부
@@ -61,6 +62,17 @@ def process_invoice(request):
     customs_code = request.data.get('customs_code')
     declaration_code = request.data.get('declaration_code')
     ai_engine = request.data.get('ai_engine', 'gpt').lower()  # 기본값: gpt
+
+    # HS 코드 추천 실행 순서 (선택)
+    hs_code_process_order = request.data.get('hs_code_process_order')
+    if hs_code_process_order:
+        try:
+            hs_code_process_order = int(hs_code_process_order)
+        except (ValueError, TypeError):
+            return Response(
+                {'success': False, 'error': 'hs_code_process_order는 숫자여야 합니다.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     if not service_slug or not customs_code or not declaration_code:
         return Response(
@@ -113,7 +125,8 @@ def process_invoice(request):
         for config in configs:
             table_configs[config.db_table_name] = {
                 'process_order': config.process_order,
-                'work_group': config.work_group
+                'work_group': config.work_group,
+                'table_prompt': config.table_prompt  # 테이블 프롬프트 추가
             }
 
         # 매핑 정보 가져오기
@@ -144,10 +157,12 @@ def process_invoice(request):
             # 테이블 처리 설정 정보 (테이블명으로 조회)
             process_order = None
             work_group = None
+            table_prompt = None
             table_config = table_configs.get(mapping.db_table_name)
             if table_config:
                 process_order = table_config['process_order']
                 work_group = table_config['work_group']
+                table_prompt = table_config['table_prompt']
 
             # 매핑 정보에 프롬프트 및 처리 순서 포함
             mapping_info.append({
@@ -157,7 +172,8 @@ def process_invoice(request):
                 'basic_prompt': basic_prompt.prompt_text if basic_prompt else None,
                 'additional_prompt': additional_prompt.prompt_text if additional_prompt else None,
                 'process_order': process_order,
-                'work_group': work_group
+                'work_group': work_group,
+                'table_prompt': table_prompt  # 테이블 프롬프트 추가
             })
 
         # AI 메타데이터 (최상위 프롬프트)
@@ -200,7 +216,8 @@ def process_invoice(request):
         result = processor.process(
             image_path=image_path,
             mapping_info=mapping_info,
-            ai_metadata=ai_metadata
+            ai_metadata=ai_metadata,
+            hs_code_process_order=hs_code_process_order
         )
 
         # 로그 업데이트
@@ -443,7 +460,8 @@ def get_declaration_config(request, declaration_id):
     for config in configs:
         table_configs[config.db_table_name] = {
             'process_order': config.process_order,
-            'work_group': config.work_group
+            'work_group': config.work_group,
+            'table_prompt': config.table_prompt  # 테이블 프롬프트 추가
         }
 
     # 매핑 정보 가져오기
@@ -473,10 +491,12 @@ def get_declaration_config(request, declaration_id):
         # 테이블 처리 설정 정보 (테이블명으로 조회)
         process_order = None
         work_group = None
+        table_prompt = None
         table_config = table_configs.get(mapping.db_table_name)
         if table_config:
             process_order = table_config['process_order']
             work_group = table_config['work_group']
+            table_prompt = table_config['table_prompt']
 
         mapping_data.append({
             'id': mapping.id,
@@ -488,6 +508,7 @@ def get_declaration_config(request, declaration_id):
             'additional_prompt': additional_prompt.prompt_text if additional_prompt else None,
             'process_order': process_order,
             'work_group': work_group,
+            'table_prompt': table_prompt,  # 테이블 프롬프트 추가
         })
 
     return Response({

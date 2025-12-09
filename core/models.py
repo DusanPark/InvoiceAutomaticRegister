@@ -135,6 +135,9 @@ class TableProcessConfig(models.Model):
     db_table_name = models.CharField(max_length=100, verbose_name='테이블명')  # DB 테이블명 (admin만 visible)
     process_order = models.IntegerField(verbose_name='처리 순서')  # 처리 순서 (admin만 visible)
 
+    # 테이블 전체에 대한 프롬프트
+    table_prompt = models.TextField(blank=True, null=True, verbose_name='테이블 프롬프트')  # 테이블 전체 추출 시 사용할 프롬프트
+
     is_active = models.BooleanField(default=True, verbose_name='활성화 여부')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='생성일시')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='수정일시')

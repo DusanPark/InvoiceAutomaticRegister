@@ -104,7 +104,8 @@ class GeminiService:
         image_path: str,
         ocr_text: str,
         mapping_info: list,
-        ai_metadata: str = None
+        ai_metadata: str = None,
+        hs_code_process_order: int = None
     ) -> Dict[str, Any]:
         """
         인보이스 이미지와 OCR 텍스트를 분석하여 JSON 형태로 데이터 정리
@@ -114,6 +115,7 @@ class GeminiService:
             ocr_text: OCR로 추출된 텍스트
             mapping_info: 매핑 정보 리스트 (프롬프트 포함)
             ai_metadata: AI 메타데이터 (최상위 컨텍스트)
+            hs_code_process_order: HS 코드 추천을 실행할 테이블 처리 순서
 
         Returns:
             정리된 JSON 데이터
@@ -124,7 +126,7 @@ class GeminiService:
 
             # 테이블별 처리 순서가 있는지 확인
             has_process_order = any(mapping.get('process_order') is not None for mapping in mapping_info)
-            return self._process_invoice_sequential(img, image_path, ocr_text, mapping_info, ai_metadata)        
+            return self._process_invoice_sequential(img, image_path, ocr_text, mapping_info, ai_metadata, hs_code_process_order)        
             #if has_process_order:
             #    # 순차 처리 로직
             #    return self._process_invoice_sequential(img, image_path, ocr_text, mapping_info, ai_metadata)
@@ -198,7 +200,8 @@ class GeminiService:
         image_path: str,
         ocr_text: str,
         mapping_info: list,
-        ai_metadata: str = None
+        ai_metadata: str = None,
+        hs_code_process_order: int = None
     ) -> Dict[str, Any]:
         """순차 처리 로직 - 처리 순서대로 단계별 처리"""
         # 처리 순서별로 매핑 정보 그룹화
@@ -242,6 +245,10 @@ class GeminiService:
         # 이전 단계 결과 누적
         previous_results = {}
         logger = logging.getLogger('core')
+
+        # HS 코드 추천 정보 저장용
+        hs_code_recommendation = None
+        hs_prompt = None
 
         # 각 순서별로 처리
         for step_num, order in enumerate(sorted_orders, 1):
@@ -288,6 +295,59 @@ class GeminiService:
                 # 리스트인 경우 테이블명을 키로 저장 (이전 결과 보존)
                 db_table_name = current_mappings[0].get('db_table_name', f'items_step_{order}')
                 previous_results[db_table_name] = step_result_korean
+
+            # HS 코드 추천 실행 (지정된 순서와 일치하는 경우)
+            if hs_code_process_order and order == hs_code_process_order:
+                logger.info(f"\n[HS CODE RECOMMENDATION] Executing at order {order}")
+
+                # 한글 키를 영문 필드명으로 변환 (HS 코드 추천 API 호출용)
+                temp_result_json = self._convert_to_english_keys(previous_results, mapping_structure)
+
+                hs_result = self.recommend_hs_code(
+                    extracted_data=temp_result_json,
+                    image_path=image_path
+                )
+
+                # HS 코드 추천 정보 저장
+                hs_code_recommendation = hs_result.get('hs_code_recommendation')
+                hs_prompt = hs_result.get('hs_prompt')
+
+                if hs_result.get('success') and hs_result.get('hs_code_recommendation'):
+                    logger.info(f"\n[HS CODE] Recommendation received")
+                    # HS 코드를 previous_results에 병합 (한글 키로)
+                    hs_codes = hs_result.get('hs_code_recommendation')
+                    logger.info(f"[DEBUG] hs_codes type: {type(hs_codes)}")
+                    logger.info(f"[DEBUG] hs_codes value: {hs_codes}")
+                    logger.info(f"[DEBUG] previous_results BEFORE merge: {previous_results}")
+
+                    # 현재 처리 중인 테이블명
+                    target_table = current_mappings[0].get('db_table_name')
+                    logger.info(f"[DEBUG] Target table for HS code: {target_table}")
+
+                    if isinstance(hs_codes, dict):
+                        # HS 코드를 현재 테이블의 데이터에 병합
+                        if target_table and target_table in previous_results:
+                            table_data = previous_results[target_table]
+
+                            if isinstance(table_data, list):
+                                # 리스트인 경우: 각 항목에 HS 코드 추가
+                                for item in table_data:
+                                    if isinstance(item, dict):
+                                        item.update(hs_codes)
+                                logger.info(f"[DEBUG] Merged HS codes into list items of {target_table}")
+                            elif isinstance(table_data, dict):
+                                # 딕셔너리인 경우: 직접 병합
+                                table_data.update(hs_codes)
+                                logger.info(f"[DEBUG] Merged HS codes into dict of {target_table}")
+                        else:
+                            # 테이블이 없으면 최상위에 추가
+                            previous_results.update(hs_codes)
+                            logger.info(f"[DEBUG] Merged HS codes at top level (table not found)")
+                    elif isinstance(hs_codes, list):
+                        previous_results['hs'] = hs_codes
+                        logger.info(f"[DEBUG] Merged as list with key 'hs'")
+
+                    logger.info(f"[DEBUG] previous_results AFTER merge: {previous_results}")
 
 
         # AI가 테이블명.필드명 형식을 사용한 경우를 한글 키로 정규화
@@ -339,7 +399,9 @@ class GeminiService:
             'raw_response': combined_response,
             'prompt': combined_prompt,
             'steps': steps_detail,  # 단계별 상세 정보
-            'total_steps': len(sorted_orders)
+            'total_steps': len(sorted_orders),
+            'hs_code_recommendation': hs_code_recommendation,  # HS 코드 추천
+            'hs_prompt': hs_prompt  # HS 코드 프롬프트
         }
 
     def _normalize_keys_to_korean(self, data, reverse_mapping: Dict):
@@ -422,6 +484,11 @@ class GeminiService:
         # AI 메타데이터를 최상위로 배치
         if ai_metadata:
             prompt += f"[문서 정보]\n{ai_metadata}\n\n"
+
+        # 테이블 프롬프트 (있는 경우)
+        table_prompt = mapping_info[0].get('table_prompt') if mapping_info and mapping_info[0].get('table_prompt') else None
+        if table_prompt:
+            prompt += f"[테이블 전체 추출 가이드]\n{table_prompt}\n\n"
 
         # 추출할 항목 및 규칙
         prompt += "[이번 단계에서 추출할 항목 및 규칙]\n"
@@ -633,7 +700,8 @@ class GeminiService:
                 return {
                     'success': True,
                     'merged_data': merged_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': prompt
                 }
             elif isinstance(extracted_data, dict) and isinstance(hs_codes, dict):
@@ -642,7 +710,8 @@ class GeminiService:
                 return {
                     'success': True,
                     'merged_data': merged_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': prompt
                 }
             else:
@@ -650,7 +719,8 @@ class GeminiService:
                 return {
                     'success': True,
                     'merged_data': extracted_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': prompt
                 }
 
@@ -695,9 +765,9 @@ Invoice에서 추출한 여러 항목의 데이터를 분석하여 각 항목별
 
 ```json
 [
-  {{"HS코드": "0000.00.00.00"}},
-  {{"HS코드": "0000.00.00.00"}},
-  {{"HS코드": "0000.00.00.00"}}
+  {{"hs": "0000.00.00.00"}},
+  {{"hs": "0000.00.00.00"}},
+  {{"hs": "0000.00.00.00"}}
 ]
 ```
 
@@ -705,7 +775,7 @@ Invoice에서 추출한 여러 항목의 데이터를 분석하여 각 항목별
 1. 반드시 JSON 배열 형식으로만 응답하세요
 2. HS코드는 10자리 형식입니다 (예: 0000.00.00.00)
 3. 설명, 근거, 기타 텍스트는 포함하지 마세요
-4. JSON 키는 "HS코드"를 사용하세요
+4. JSON 키는 "hs"를 사용하세요
 5. 항목 개수만큼 배열에 포함해주세요 (총 {len(extracted_data)}개)
 """
         elif isinstance(extracted_data, dict):
@@ -770,11 +840,13 @@ Invoice에서 추출한 데이터를 분석하여 적합한 HS코드(관세율�
 
         return prompt
 
+logger = logging.getLogger('core')
 
 class ChatGPTService:
     """OpenAI ChatGPT API 서비스"""
 
     def __init__(self):
+        
         # OpenAI 클라이언트 초기화 (proxy 없이)
         try:
             # httpx 클라이언트를 직접 생성 (환경 변수의 proxy 설정 무시)
@@ -796,7 +868,8 @@ class ChatGPTService:
         image_path: str,
         ocr_text: str,
         mapping_info: list,
-        ai_metadata: str = None
+        ai_metadata: str = None,
+        hs_code_process_order: int = None
     ) -> Dict[str, Any]:
         """
         인보이스 이미지와 OCR 텍스트를 분석하여 JSON 형태로 데이터 정리
@@ -806,6 +879,7 @@ class ChatGPTService:
             ocr_text: OCR로 추출된 텍스트
             mapping_info: 매핑 정보 리스트 (프롬프트 포함)
             ai_metadata: AI 메타데이터 (최상위 컨텍스트)
+            hs_code_process_order: HS 코드 추천을 실행할 테이블 처리 순서
 
         Returns:
             정리된 JSON 데이터
@@ -813,7 +887,7 @@ class ChatGPTService:
         try:
             # 테이블별 처리 순서가 있는지 확인
             has_process_order = any(mapping.get('process_order') is not None for mapping in mapping_info)
-            return self._process_invoice_sequential(image_path, ocr_text, mapping_info, ai_metadata)
+            return self._process_invoice_sequential(image_path, ocr_text, mapping_info, ai_metadata, hs_code_process_order)
             #if has_process_order:
             #    # 순차 처리 로직
             #    return self._process_invoice_sequential(image_path, ocr_text, mapping_info, ai_metadata)
@@ -835,7 +909,8 @@ class ChatGPTService:
         image_path: str,
         ocr_text: str,
         mapping_info: list,
-        ai_metadata: str = None
+        ai_metadata: str = None,
+        hs_code_process_order: int = None
     ) -> Dict[str, Any]:
         """순차 처리 로직 - 처리 순서대로 단계별 처리"""
         try:
@@ -880,6 +955,10 @@ class ChatGPTService:
             # 전체 프롬프트 저장용
             all_prompts = []
             all_responses = []
+
+            # HS 코드 추천 정보 저장용
+            hs_code_recommendation = None
+            hs_prompt = None
 
             # 이전 단계 결과 누적
             previous_results = {}
@@ -930,7 +1009,7 @@ class ChatGPTService:
                 try:
                     # ChatGPT API 호출
                     response = self.client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-4.1",
                         messages=[
                             {
                                 "role": "system",
@@ -972,6 +1051,60 @@ class ChatGPTService:
                         # 리스트인 경우 테이블명을 키로 저장 (이전 결과 보존)
                         db_table_name = current_mappings[0].get('db_table_name', f'items_step_{order}')
                         previous_results[db_table_name] = step_result_korean
+
+                    # HS 코드 추천 실행 (지정된 순서와 일치하는 경우)
+                    if hs_code_process_order and order == hs_code_process_order:
+                        logger.info(f"\n[HS CODE RECOMMENDATION] Executing at order {order}")
+
+                        # 한글 키를 영문 필드명으로 변환 (HS 코드 추천 API 호출용)
+                        temp_result_json = self._convert_to_english_keys(previous_results, mapping_structure)
+
+                        hs_result = self.recommend_hs_code(
+                            extracted_data=temp_result_json,
+                            image_path=image_path
+                        )
+
+                        # HS 코드 추천 정보 저장
+                        hs_code_recommendation = hs_result.get('hs_code_recommendation')
+                        hs_prompt = hs_result.get('hs_prompt')
+
+                        if hs_result.get('success') and hs_result.get('hs_code_recommendation'):
+                            logger.info(f"\n[HS CODE] Recommendation received")
+                            # HS 코드를 previous_results에 병합 (한글 키로)
+                            hs_codes = hs_result.get('hs_code_recommendation')
+                            logger.info(f"[DEBUG] hs_codes type: {type(hs_codes)}")
+                            logger.info(f"[DEBUG] hs_codes value: {hs_codes}")
+                            logger.info(f"[DEBUG] previous_results BEFORE merge: {previous_results}")
+
+                            # 현재 처리 중인 테이블명
+                            target_table = current_mappings[0].get('db_table_name')
+                            logger.info(f"[DEBUG] Target table for HS code: {target_table}")
+
+                            if isinstance(hs_codes, dict):
+                                # HS 코드를 현재 테이블의 데이터에 병합
+                                if target_table and target_table in previous_results:
+                                    table_data = previous_results[target_table]
+
+                                    if isinstance(table_data, list):
+                                        # 리스트인 경우: 각 항목에 HS 코드 추가
+                                        for item in table_data:
+                                            if isinstance(item, dict):
+                                                item.update(hs_codes)
+                                        logger.info(f"[DEBUG] Merged HS codes into list items of {target_table}")
+                                    elif isinstance(table_data, dict):
+                                        # 딕셔너리인 경우: 직접 병합
+                                        table_data.update(hs_codes)
+                                        logger.info(f"[DEBUG] Merged HS codes into dict of {target_table}")
+                                else:
+                                    # 테이블이 없으면 최상위에 추가
+                                    previous_results.update(hs_codes)
+                                    logger.info(f"[DEBUG] Merged HS codes at top level (table not found)")
+                            elif isinstance(hs_codes, list):
+                                previous_results['hs'] = hs_codes
+                                logger.info(f"[DEBUG] Merged as list with key 'hs'")
+
+                            logger.info(f"[DEBUG] previous_results AFTER merge: {previous_results}")
+
                 except Exception as e:
                     continue
 
@@ -1023,7 +1156,9 @@ class ChatGPTService:
                 'system_prompt': combined_prompt,
                 'user_prompt': 'Sequential processing - see combined prompt',
                 'steps': steps_detail,  # 단계별 상세 정보
-                'total_steps': len(sorted_orders)
+                'total_steps': len(sorted_orders),
+                'hs_code_recommendation': hs_code_recommendation,  # HS 코드 추천
+                'hs_prompt': hs_prompt  # HS 코드 프롬프트
             }
 
         except Exception as e:
@@ -1098,12 +1233,16 @@ class ChatGPTService:
         prompt += "이 작업은 여러 단계로 나뉘어 처리됩니다. 현재 단계에서는 아래 지정된 항목만 추출하면 됩니다.\n\n"
 
         # 이전 단계 결과가 있으면 포함
+        
+        logger.info(f"\nStep {step_num} previous_results : {previous_results}\n")
         if previous_results:
             prompt += "[이전 단계에서 추출된 데이터]\n"
             prompt += "참고: 아래는 이전 단계에서 이미 추출된 데이터입니다. 이 정보를 참고하여 현재 단계의 데이터를 추출하세요.\n\n"
             if isinstance(previous_results, dict):
                 for key, value in previous_results.items():
                     prompt += f"  - {key}: {value}\n"
+                    
+                    logger.info(f"\nStep {step_num}[key] : {key} / [value] : {value}\n")
             else:
                 prompt += f"{previous_results}\n"
             prompt += "\n"
@@ -1111,15 +1250,32 @@ class ChatGPTService:
         prompt += "=== 중요: 첨부된 이미지를 우선적으로 분석하세요 ===\n"
         prompt += "이 요청에는 인보이스 이미지가 첨부되어 있습니다. 반드시 이미지를 직접 확인하여 정확한 정보를 추출하세요.\n\n"
 
+        logger.info(f"\nStep {step_num} ai_metadata : {ai_metadata}\n")
         # AI 메타데이터를 최상위로 배치
         if ai_metadata:
             prompt += f"[문서 정보]\n{ai_metadata}\n\n"
+
+        # 테이블 정보 추출 (테이블명과 table_prompt)
+        table_info = {}
+        for mapping in mapping_info:
+            table_name = mapping.get('db_table_name')
+            table_prompt = mapping.get('table_prompt')
+            if table_name and table_name not in table_info:
+                table_info[table_name] = table_prompt
+
+        # 테이블 프롬프트가 있는 경우 표시
+        if any(table_info.values()):
+            prompt += "[테이블별 추출 가이드]\n"
+            for table_name, table_prompt in table_info.items():
+                if table_prompt:
+                    prompt += f"\n<{table_name} 테이블>\n{table_prompt}\n"
+            prompt += "\n"
 
         # 추출할 항목 및 규칙
         prompt += "[이번 단계에서 추출할 항목 및 규칙]\n"
         prompt += "다음 항목들의 데이터를 이미지에서 찾아 아래 규칙에 따라 추출해주세요:\n\n"
 
-        # 각 매핑 정보별로 항목과 프롬프트 배치
+        # 각 매핑 정보별로 항목과 프롬프트 배치 (table_prompt는 제외)
         for mapping in mapping_info:
             field_name = mapping['unipass_field_name']
 
@@ -1395,12 +1551,11 @@ Invoice에서 추출한 데이터를 분석하여 적합한 HS코드(관세율�
             hs_prompt = self._build_hs_code_prompt(extracted_data)
 
             # Request 로깅
-            logger = logging.getLogger('core')
             logger.info(f"\nCHATGPT HS CODE REQUEST:\n{hs_prompt}\n")
 
             # ChatGPT API 호출
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4.1",
                 messages=[
                     {
                         "role": "user",
@@ -1443,7 +1598,8 @@ Invoice에서 추출한 데이터를 분석하여 적합한 HS코드(관세율�
                 return {
                     'success': True,
                     'merged_data': merged_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': hs_prompt
                 }
             elif isinstance(extracted_data, dict) and isinstance(hs_codes, dict):
@@ -1452,7 +1608,8 @@ Invoice에서 추출한 데이터를 분석하여 적합한 HS코드(관세율�
                 return {
                     'success': True,
                     'merged_data': merged_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': hs_prompt
                 }
             else:
@@ -1460,7 +1617,8 @@ Invoice에서 추출한 데이터를 분석하여 적합한 HS코드(관세율�
                 return {
                     'success': True,
                     'merged_data': extracted_data,
-                    'hs_code_recommendation': result_text,
+                    'hs_code_recommendation': hs_codes,  # 파싱된 JSON
+                    'hs_code_response_text': result_text,  # 원본 텍스트
                     'hs_prompt': hs_prompt
                 }
 
@@ -1489,7 +1647,8 @@ class InvoiceProcessor:
         self,
         image_path: str,
         mapping_info: list,
-        ai_metadata: str = None
+        ai_metadata: str = None,
+        hs_code_process_order: int = None
     ) -> Dict[str, Any]:
         """
         전체 인보이스 처리 파이프라인
@@ -1499,6 +1658,7 @@ class InvoiceProcessor:
             image_path: 이미지 파일 경로
             mapping_info: 매핑 정보 (프롬프트 포함)
             ai_metadata: AI 메타데이터 (최상위 컨텍스트)
+            hs_code_process_order: HS 코드 추천을 실행할 테이블 처리 순서
 
         Returns:
             처리 결과
@@ -1526,7 +1686,8 @@ class InvoiceProcessor:
                 image_path=image_path,
                 ocr_text=ocr_text,
                 mapping_info=mapping_info,
-                ai_metadata=ai_metadata
+                ai_metadata=ai_metadata,
+                hs_code_process_order=hs_code_process_order
             )
 
             result['gpt_response'] = ai_result.get('raw_response')
@@ -1547,19 +1708,9 @@ class InvoiceProcessor:
             result['result_json'] = ai_result['data']
             result['success'] = True
 
-            # Step 6: HS코드 추천 및 데이터 병합 (선택적)
-            if result['success'] and result['result_json']:
-                hs_result = self.ai_service.recommend_hs_code(
-                    extracted_data=result['result_json'],
-                    image_path=image_path
-                )
-
-                # HS코드가 병합된 데이터로 업데이트
-                if hs_result.get('success') and hs_result.get('merged_data'):
-                    result['result_json'] = hs_result.get('merged_data')
-
-                result['hs_code_recommendation'] = hs_result.get('hs_code_recommendation')
-                result['hs_prompt'] = hs_result.get('hs_prompt')
+            # HS 코드 추천 정보 (특정 순서에서 실행된 경우)
+            result['hs_code_recommendation'] = ai_result.get('hs_code_recommendation')
+            result['hs_prompt'] = ai_result.get('hs_prompt')
 
         except Exception as e:
             result['error'] = str(e)

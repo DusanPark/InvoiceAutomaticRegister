@@ -53,7 +53,7 @@ class TableProcessConfigAdmin(admin.ModelAdmin):
         if request.user.is_superuser or request.user.user_type == 'admin':
             # admin은 모든 필드 표시
             return ['declaration', 'service_user', 'work_group', 'db_table_name',
-                   'process_order', 'is_active']
+                   'process_order', 'table_prompt', 'is_active']
         else:
             # 일반 사용자는 업무그룹만 표시
             return ['declaration', 'service_user', 'work_group', 'is_active']

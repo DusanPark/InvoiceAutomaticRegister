@@ -9,7 +9,8 @@
       "Bash(del test_openai_key.py)",
       "Bash(pip show:*)",
       "Bash(dir:*)",
-      "Bash(python manage.py:*)"
+      "Bash(python manage.py:*)",
+      "Bash(python add_table_prompt_column.py:*)"
     ],
     "deny": [],
     "ask": []
