@@ -485,26 +485,41 @@ class GeminiService:
         if ai_metadata:
             prompt += f"[문서 정보]\n{ai_metadata}\n\n"
 
-        # 테이블 프롬프트 (있는 경우)
-        table_prompt = mapping_info[0].get('table_prompt') if mapping_info and mapping_info[0].get('table_prompt') else None
-        if table_prompt:
-            prompt += f"[테이블 전체 추출 가이드]\n{table_prompt}\n\n"
+        # 테이블별로 그룹화 (table_prompt를 테이블 단위로 처리)
+        table_groups = {}
+        for mapping in mapping_info:
+            table_name = mapping.get('db_table_name', 'unknown')
+            if table_name not in table_groups:
+                table_groups[table_name] = {
+                    'table_prompt': mapping.get('table_prompt'),
+                    'mappings': []
+                }
+            table_groups[table_name]['mappings'].append(mapping)
 
         # 추출할 항목 및 규칙
         prompt += "[이번 단계에서 추출할 항목 및 규칙]\n"
         prompt += "다음 항목들의 데이터를 이미지에서 찾아 아래 규칙에 따라 추출해주세요:\n\n"
 
-        # 각 매핑 정보별로 항목과 프롬프트 배치
-        for mapping in mapping_info:
-            field_name = mapping['unipass_field_name']
+        # 테이블별로 프롬프트 구성
+        for table_name, table_data in table_groups.items():
+            # 테이블 프롬프트가 있으면 먼저 표시
+            if table_data['table_prompt']:
+                prompt += f"[{table_name} 테이블 - 추출 형식]\n"
+                prompt += f"{table_data['table_prompt']}\n\n"
 
-            prompt += f"• {field_name}\n"
+            # 해당 테이블의 필드들
+            prompt += f"<{table_name} 테이블의 필드들>\n"
+            for mapping in table_data['mappings']:
+                field_name = mapping['unipass_field_name']
+                prompt += f"• {field_name}\n"
 
-            if mapping.get('basic_prompt'):
-                prompt += f"  - {mapping['basic_prompt']}\n"
+                if mapping.get('basic_prompt'):
+                    prompt += f"  - {mapping['basic_prompt']}\n"
 
-            if mapping.get('additional_prompt'):
-                prompt += f"  - {mapping['additional_prompt']}\n"
+                if mapping.get('additional_prompt'):
+                    prompt += f"  - {mapping['additional_prompt']}\n"
+
+                prompt += "\n"
 
             prompt += "\n"
 
@@ -519,15 +534,31 @@ class GeminiService:
 **중요**: JSON의 키는 위에 제시된 한글 항목명(유니패스 필드명)을 그대로 사용해야 합니다.
 **주의**: 이번 단계에서 요청한 항목만 JSON에 포함하세요. 이전 단계 데이터는 포함하지 마세요.
 
+단일 값 형식:
 ```json
 {
   "항목명1": "추출된_값1",
-  "항목명2": "추출된_값2",
-  ...
+  "항목명2": "추출된_값2"
 }
 ```
 
-예시:
+리스트 형식 (테이블 프롬프트에서 리스트 형식 요청 시):
+```json
+{
+  "테이블명": [
+    {
+      "항목명1": "값1",
+      "항목명2": "값2"
+    },
+    {
+      "항목명1": "값3",
+      "항목명2": "값4"
+    }
+  ]
+}
+```
+
+예시 1 (단일 값):
 ```json
 {
   "판매자명": "N.S TRADING",
@@ -536,16 +567,33 @@ class GeminiService:
 }
 ```
 
+예시 2 (리스트 형식):
+```json
+{
+  "CUSDEC830A1": [
+    {
+      "수출화주주소": "서울시 강남구",
+      "전화번호": "02-1234-5678"
+    },
+    {
+      "수출화주주소": "부산시 해운대구",
+      "전화번호": "051-9876-5432"
+    }
+  ]
+}
+```
+
 주의사항:
 1. **반드시 첨부된 이미지를 직접 분석**하여 정확한 정보를 추출하세요.
 2. OCR 텍스트는 참고용이며, 이미지가 우선입니다.
 3. 이전 단계 데이터는 참고만 하고, 현재 단계 항목만 추출하세요.
-4. 값을 찾을 수 없는 경우 null을 사용하세요.
-5. 날짜는 YYYY-MM-DD 형식으로 변환하세요.
-6. 숫자는 천단위 구분자 없이 숫자만 추출하세요.
-7. JSON 키는 위에 제시된 한글 항목명을 정확히 사용하세요.
-8. 반드시 JSON 형식으로만 응답하세요.
-9. 각 항목별로 제시된 규칙을 준수하세요.
+4. **테이블 프롬프트에서 리스트 형식을 요청한 경우, 반드시 배열 형태로 반환하세요.**
+5. 값을 찾을 수 없는 경우 null을 사용하세요.
+6. 날짜는 YYYY-MM-DD 형식으로 변환하세요.
+7. 숫자는 천단위 구분자 없이 숫자만 추출하세요.
+8. JSON 키는 위에 제시된 한글 항목명을 정확히 사용하세요.
+9. 반드시 JSON 형식으로만 응답하세요.
+10. 각 항목별로 제시된 규칙을 준수하세요.
 """
         return prompt
 
@@ -1255,37 +1303,41 @@ class ChatGPTService:
         if ai_metadata:
             prompt += f"[문서 정보]\n{ai_metadata}\n\n"
 
-        # 테이블 정보 추출 (테이블명과 table_prompt)
-        table_info = {}
+        # 테이블별로 그룹화 (table_prompt를 테이블 단위로 처리)
+        table_groups = {}
         for mapping in mapping_info:
-            table_name = mapping.get('db_table_name')
-            table_prompt = mapping.get('table_prompt')
-            if table_name and table_name not in table_info:
-                table_info[table_name] = table_prompt
-
-        # 테이블 프롬프트가 있는 경우 표시
-        if any(table_info.values()):
-            prompt += "[테이블별 추출 가이드]\n"
-            for table_name, table_prompt in table_info.items():
-                if table_prompt:
-                    prompt += f"\n<{table_name} 테이블>\n{table_prompt}\n"
-            prompt += "\n"
+            table_name = mapping.get('db_table_name', 'unknown')
+            if table_name not in table_groups:
+                table_groups[table_name] = {
+                    'table_prompt': mapping.get('table_prompt'),
+                    'mappings': []
+                }
+            table_groups[table_name]['mappings'].append(mapping)
 
         # 추출할 항목 및 규칙
         prompt += "[이번 단계에서 추출할 항목 및 규칙]\n"
         prompt += "다음 항목들의 데이터를 이미지에서 찾아 아래 규칙에 따라 추출해주세요:\n\n"
 
-        # 각 매핑 정보별로 항목과 프롬프트 배치 (table_prompt는 제외)
-        for mapping in mapping_info:
-            field_name = mapping['unipass_field_name']
+        # 테이블별로 프롬프트 구성
+        for table_name, table_data in table_groups.items():
+            # 테이블 프롬프트가 있으면 먼저 표시
+            if table_data['table_prompt']:
+                prompt += f"[{table_name} 테이블 - 추출 형식]\n"
+                prompt += f"{table_data['table_prompt']}\n\n"
 
-            prompt += f"• {field_name}\n"
+            # 해당 테이블의 필드들
+            prompt += f"<{table_name} 테이블의 필드들>\n"
+            for mapping in table_data['mappings']:
+                field_name = mapping['unipass_field_name']
+                prompt += f"• {field_name}\n"
 
-            if mapping.get('basic_prompt'):
-                prompt += f"  - {mapping['basic_prompt']}\n"
+                if mapping.get('basic_prompt'):
+                    prompt += f"  - {mapping['basic_prompt']}\n"
 
-            if mapping.get('additional_prompt'):
-                prompt += f"  - {mapping['additional_prompt']}\n"
+                if mapping.get('additional_prompt'):
+                    prompt += f"  - {mapping['additional_prompt']}\n"
+
+                prompt += "\n"
 
             prompt += "\n"
 
@@ -1294,15 +1346,31 @@ class ChatGPTService:
 **중요**: JSON의 키는 위에 제시된 한글 항목명(유니패스 필드명)을 그대로 사용해야 합니다.
 **주의**: 이번 단계에서 요청한 항목만 JSON에 포함하세요. 이전 단계 데이터는 포함하지 마세요.
 
+단일 값 형식:
 ```json
 {
   "항목명1": "추출된_값1",
-  "항목명2": "추출된_값2",
-  ...
+  "항목명2": "추출된_값2"
 }
 ```
 
-예시:
+리스트 형식 (테이블 프롬프트에서 리스트 형식 요청 시):
+```json
+{
+  "테이블명": [
+    {
+      "항목명1": "값1",
+      "항목명2": "값2"
+    },
+    {
+      "항목명1": "값3",
+      "항목명2": "값4"
+    }
+  ]
+}
+```
+
+예시 1 (단일 값):
 ```json
 {
   "판매자명": "N.S TRADING",
@@ -1311,16 +1379,33 @@ class ChatGPTService:
 }
 ```
 
+예시 2 (리스트 형식):
+```json
+{
+  "CUSDEC830A1": [
+    {
+      "수출화주주소": "서울시 강남구",
+      "전화번호": "02-1234-5678"
+    },
+    {
+      "수출화주주소": "부산시 해운대구",
+      "전화번호": "051-9876-5432"
+    }
+  ]
+}
+```
+
 주의사항:
 1. **반드시 첨부된 이미지를 직접 분석**하여 정확한 정보를 추출하세요.
 2. OCR 텍스트는 참고용이며, 이미지가 우선입니다.
 3. 이전 단계 데이터는 참고만 하고, 현재 단계 항목만 추출하세요.
-4. 값을 찾을 수 없는 경우 생략하세요.
-5. 날짜는 YYYY-MM-DD 형식으로 변환하세요.
-6. 숫자는 천단위 구분자 없이 숫자만 추출하세요.
-7. JSON 키는 위에 제시된 한글 항목명을 정확히 사용하세요.
-8. 반드시 JSON 형식으로만 응답하세요.
-9. 각 항목별로 제시된 규칙을 준수하세요.
+4. **테이블 프롬프트에서 리스트 형식을 요청한 경우, 반드시 배열 형태로 반환하세요.**
+5. 값을 찾을 수 없는 경우 생략하세요.
+6. 날짜는 YYYY-MM-DD 형식으로 변환하세요.
+7. 숫자는 천단위 구분자 없이 숫자만 추출하세요.
+8. JSON 키는 위에 제시된 한글 항목명을 정확히 사용하세요.
+9. 반드시 JSON 형식으로만 응답하세요.
+10. 각 항목별로 제시된 규칙을 준수하세요.
 """
         return prompt
 
